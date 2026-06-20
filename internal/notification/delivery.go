@@ -1,0 +1,91 @@
+package notification
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+type DeliveryResult struct {
+	Success      bool
+	Retryable    bool
+	ErrorMessage string
+	RetryAfter   *time.Time
+}
+
+type Delivery interface {
+	Send(ctx context.Context, n Notification) DeliveryResult
+}
+
+type HTTPDelivery struct {
+	client *http.Client
+}
+
+func NewHTTPDelivery(client *http.Client) HTTPDelivery {
+	if client == nil {
+		panic("http client is required")
+	}
+	return HTTPDelivery{client: client}
+}
+
+func (d HTTPDelivery) Send(ctx context.Context, n Notification) DeliveryResult {
+	req, err := http.NewRequestWithContext(ctx, n.Method, n.TargetURL, bytes.NewReader(n.Body))
+	if err != nil {
+		return DeliveryResult{Retryable: false, ErrorMessage: err.Error()}
+	}
+	for k, v := range n.Headers {
+		req.Header.Set(k, v)
+	}
+	if req.Header.Get("Idempotency-Key") == "" && n.IdempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", n.IdempotencyKey)
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return DeliveryResult{Retryable: true, ErrorMessage: err.Error()}
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return DeliveryResult{Success: true}
+	}
+	retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+	if isRetryableStatus(resp.StatusCode) {
+		return DeliveryResult{
+			Retryable:    true,
+			ErrorMessage: fmt.Sprintf("vendor returned HTTP %d", resp.StatusCode),
+			RetryAfter:   retryAfter,
+		}
+	}
+	return DeliveryResult{
+		Retryable:    false,
+		ErrorMessage: fmt.Sprintf("vendor returned HTTP %d", resp.StatusCode),
+	}
+}
+
+func isRetryableStatus(status int) bool {
+	if status == http.StatusRequestTimeout || status == http.StatusConflict || status == http.StatusTooManyRequests {
+		return true
+	}
+	return status >= 500 && status <= 599
+}
+
+func parseRetryAfter(value string, now time.Time) *time.Time {
+	if value == "" {
+		return nil
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		t := now.Add(time.Duration(seconds) * time.Second)
+		return &t
+	}
+	t, err := http.ParseTime(value)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
