@@ -57,9 +57,9 @@ func (w Worker) RunOnce(ctx context.Context) {
 }
 
 func (w Worker) runOnce(ctx context.Context) {
-	due, err := w.store.FetchDue(time.Now(), w.config.BatchSize, w.config.SendingLease)
+	due, err := w.store.ClaimDue(time.Now(), w.config.BatchSize, w.config.SendingLease)
 	if err != nil {
-		log.Printf("fetch due notifications: %v", err)
+		log.Printf("claim due notifications: %v", err)
 		return
 	}
 	var wg sync.WaitGroup
@@ -68,24 +68,22 @@ func (w Worker) runOnce(ctx context.Context) {
 			break
 		}
 		wg.Add(1)
-		go func(id string) {
+		go func(n Notification) {
 			defer wg.Done()
-			w.process(ctx, id)
-		}(n.ID)
+			w.process(ctx, n)
+		}(n)
 	}
 	wg.Wait()
 }
 
-func (w Worker) process(ctx context.Context, id string) {
+func (w Worker) process(ctx context.Context, n Notification) {
 	now := time.Now()
-	n, err := w.store.MarkSending(id, now)
-	if err != nil {
-		log.Printf("mark notification sending: %v", err)
-		return
-	}
+	startedAt := now
 	result := w.delivery.Send(ctx, n)
 	now = time.Now()
+
 	if result.Success {
+		w.recordAttempt(n, AttemptSucceeded, result, nil, startedAt, now)
 		if err := w.store.MarkSuccess(n.ID, now); err != nil {
 			log.Printf("mark notification success: %v", err)
 		}
@@ -97,6 +95,7 @@ func (w Worker) process(ctx context.Context, id string) {
 		message = "delivery failed"
 	}
 	if !result.Retryable || n.AttemptCount >= n.MaxAttempts {
+		w.recordAttempt(n, AttemptFailed, result, nil, startedAt, now)
 		if err := w.store.MarkFailed(n.ID, message, now); err != nil {
 			log.Printf("mark notification failed: %v", err)
 		}
@@ -107,7 +106,26 @@ func (w Worker) process(ctx context.Context, id string) {
 	if result.RetryAfter != nil && result.RetryAfter.After(nextRetryAt) {
 		nextRetryAt = *result.RetryAfter
 	}
+	w.recordAttempt(n, AttemptRetrying, result, &nextRetryAt, startedAt, now)
 	if err := w.store.MarkRetry(n.ID, message, nextRetryAt, now); err != nil {
 		log.Printf("mark notification retrying: %v", err)
+	}
+}
+
+func (w Worker) recordAttempt(n Notification, status AttemptStatus, result DeliveryResult, nextRetryAt *time.Time, startedAt time.Time, finishedAt time.Time) {
+	attempt := DeliveryAttempt{
+		ID:             newAttemptID(),
+		NotificationID: n.ID,
+		AttemptNo:      n.AttemptCount,
+		Status:         status,
+		StatusCode:     result.StatusCode,
+		Retryable:      result.Retryable,
+		Error:          result.ErrorMessage,
+		NextRetryAt:    nextRetryAt,
+		StartedAt:      startedAt,
+		FinishedAt:     finishedAt,
+	}
+	if err := w.store.RecordAttempt(attempt); err != nil {
+		log.Printf("record delivery attempt: %v", err)
 	}
 }

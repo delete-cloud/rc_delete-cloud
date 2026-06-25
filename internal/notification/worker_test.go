@@ -20,7 +20,7 @@ func (f *fakeDelivery) Send(_ context.Context, n Notification) DeliveryResult {
 
 func TestWorkerMarksNotificationSucceeded(t *testing.T) {
 	store := newTestStore(t)
-	delivery := &fakeDelivery{result: DeliveryResult{Success: true}}
+	delivery := &fakeDelivery{result: DeliveryResult{Success: true, StatusCode: 204}}
 	created := createTestNotification(t, store, DefaultMaxAttempts)
 
 	worker := NewWorker(store, delivery, WorkerConfig{BatchSize: 10})
@@ -39,11 +39,16 @@ func TestWorkerMarksNotificationSucceeded(t *testing.T) {
 	if len(delivery.seen) != 1 {
 		t.Fatalf("delivery calls = %d, want 1", len(delivery.seen))
 	}
+	attempts, err := store.ListAttempts(created.ID)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	assertSingleAttempt(t, attempts, AttemptSucceeded, 1, 204, "")
 }
 
 func TestWorkerRetriesTransientFailure(t *testing.T) {
 	store := newTestStore(t)
-	delivery := &fakeDelivery{result: DeliveryResult{Retryable: true, ErrorMessage: "vendor returned HTTP 503"}}
+	delivery := &fakeDelivery{result: DeliveryResult{Retryable: true, StatusCode: 503, ErrorMessage: "vendor returned HTTP 503"}}
 	created := createTestNotification(t, store, DefaultMaxAttempts)
 
 	worker := NewWorker(store, delivery, WorkerConfig{BatchSize: 10})
@@ -71,11 +76,19 @@ func TestWorkerRetriesTransientFailure(t *testing.T) {
 	if !strings.Contains(got.LastError, "503") {
 		t.Fatalf("last error = %q, want HTTP status detail", got.LastError)
 	}
+	attempts, err := store.ListAttempts(created.ID)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	attempt := assertSingleAttempt(t, attempts, AttemptRetrying, 1, 503, "503")
+	if attempt.NextRetryAt == nil {
+		t.Fatalf("attempt next retry is nil")
+	}
 }
 
 func TestWorkerFailsPermanentFailureWithoutRetry(t *testing.T) {
 	store := newTestStore(t)
-	delivery := &fakeDelivery{result: DeliveryResult{Retryable: false, ErrorMessage: "vendor returned HTTP 400"}}
+	delivery := &fakeDelivery{result: DeliveryResult{Retryable: false, StatusCode: 400, ErrorMessage: "vendor returned HTTP 400"}}
 	created := createTestNotification(t, store, DefaultMaxAttempts)
 
 	worker := NewWorker(store, delivery, WorkerConfig{BatchSize: 10})
@@ -91,6 +104,11 @@ func TestWorkerFailsPermanentFailureWithoutRetry(t *testing.T) {
 	if got.NextRetryAt != nil {
 		t.Fatalf("next retry = %s, want nil", got.NextRetryAt)
 	}
+	attempts, err := store.ListAttempts(created.ID)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	assertSingleAttempt(t, attempts, AttemptFailed, 1, 400, "400")
 }
 
 func TestWorkerFailsAfterMaxAttempts(t *testing.T) {
@@ -111,6 +129,39 @@ func TestWorkerFailsAfterMaxAttempts(t *testing.T) {
 	if got.AttemptCount != 1 {
 		t.Fatalf("attempt count = %d, want 1", got.AttemptCount)
 	}
+	attempts, err := store.ListAttempts(created.ID)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	assertSingleAttempt(t, attempts, AttemptFailed, 1, 0, "timeout")
+}
+
+func TestWorkerKeepsAttemptHistoryMonotonicAfterManualRetry(t *testing.T) {
+	store := newTestStore(t)
+	delivery := &fakeDelivery{result: DeliveryResult{Retryable: true, ErrorMessage: "timeout"}}
+	created := createTestNotification(t, store, 1)
+
+	worker := NewWorker(store, delivery, WorkerConfig{BatchSize: 10})
+	worker.RunOnce(context.Background())
+	if _, err := store.RetryFailed(created.ID, time.Now()); err != nil {
+		t.Fatalf("retry failed notification: %v", err)
+	}
+	delivery.result = DeliveryResult{Success: true, StatusCode: 200}
+	worker.RunOnce(context.Background())
+
+	attempts, err := store.ListAttempts(created.ID)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("attempt count = %d, want 2", len(attempts))
+	}
+	if attempts[0].AttemptNo != 1 || attempts[0].Status != AttemptFailed {
+		t.Fatalf("first attempt = (%d, %s), want (1, %s)", attempts[0].AttemptNo, attempts[0].Status, AttemptFailed)
+	}
+	if attempts[1].AttemptNo != 2 || attempts[1].Status != AttemptSucceeded {
+		t.Fatalf("second attempt = (%d, %s), want (2, %s)", attempts[1].AttemptNo, attempts[1].Status, AttemptSucceeded)
+	}
 }
 
 func createTestNotification(t *testing.T, store Store, maxAttempts int) Notification {
@@ -130,4 +181,34 @@ func createTestNotification(t *testing.T, store Store, maxAttempts int) Notifica
 		t.Fatalf("new notification returned duplicate=true")
 	}
 	return created
+}
+
+func assertSingleAttempt(t *testing.T, attempts []DeliveryAttempt, wantStatus AttemptStatus, wantNo int, wantStatusCode int, wantError string) DeliveryAttempt {
+	t.Helper()
+	if len(attempts) != 1 {
+		t.Fatalf("attempt count = %d, want 1", len(attempts))
+	}
+	attempt := attempts[0]
+	if attempt.Status != wantStatus {
+		t.Fatalf("attempt status = %s, want %s", attempt.Status, wantStatus)
+	}
+	if attempt.AttemptNo != wantNo {
+		t.Fatalf("attempt no = %d, want %d", attempt.AttemptNo, wantNo)
+	}
+	if attempt.StatusCode != wantStatusCode {
+		t.Fatalf("attempt status code = %d, want %d", attempt.StatusCode, wantStatusCode)
+	}
+	if wantError != "" && !strings.Contains(attempt.Error, wantError) {
+		t.Fatalf("attempt error = %q, want to contain %q", attempt.Error, wantError)
+	}
+	if attempt.StartedAt.IsZero() {
+		t.Fatalf("attempt startedAt is zero")
+	}
+	if attempt.FinishedAt.IsZero() {
+		t.Fatalf("attempt finishedAt is zero")
+	}
+	if attempt.FinishedAt.Before(attempt.StartedAt) {
+		t.Fatalf("attempt finishedAt %s is before startedAt %s", attempt.FinishedAt, attempt.StartedAt)
+	}
+	return attempt
 }

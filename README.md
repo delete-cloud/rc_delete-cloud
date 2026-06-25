@@ -1,4 +1,4 @@
-# rc-delete-cloud
+# rc_delete-cloud
 
 一个内部 HTTP 通知投递服务 MVP。业务系统把外部供应商 API 的调用请求提交给本服务；本服务先持久化任务并立即返回，再由后台 worker 异步投递、失败重试、记录最终状态。
 
@@ -18,17 +18,21 @@ Business System
 
 ## 当前实现
 
-本仓库用 Go 标准库实现了一个最小可运行版本：
+本仓库用 Go 标准库 + SQLite 实现了一个最小可运行版本：
 
 - `POST /notifications`：创建通知任务，返回 `202 Accepted`。
+- `GET /notifications?status=FAILED`：查看指定状态的任务，可用于 MVP 阶段的逻辑 DLQ 排查。
 - `GET /notifications/{id}`：查询任务状态。
+- `GET /notifications/{id}/attempts`：查询每一次投递尝试记录。
 - `POST /notifications/{id}/retry`：把 `FAILED` 任务重新放回重试队列。
-- 文件持久化队列：默认保存到 `data/notifications.json`。
-- 后台 worker：扫描 `PENDING` / `RETRYING` / 超过租约的 `SENDING` 任务。
-- HTTP 投递：2xx 视为成功；网络错误、超时、5xx、408、409、429 视为可重试；其他 4xx 视为永久失败。
+- SQLite 持久化任务表：默认保存到 `data/notifications.db`。
+- 后台 worker：通过 SQLite 事务领取 `PENDING` / `RETRYING` / 超过租约的 `SENDING` 任务。
+- HTTP 投递：第一版只按 HTTP status 判断投递结果，不解析响应 body。2xx 视为成功；网络错误、超时、5xx、408、409、429 视为可重试；其他 4xx 视为永久失败。
 - 指数退避：10s、20s、40s ... 上限 5min。
 - 默认最大尝试次数：5 次。
-- `idempotencyKey`：相同 key 重复提交时返回已有任务，减少业务系统重试造成的重复任务。
+- `idempotencyKey`：业务事件唯一键。相同 key 且请求内容一致时返回已有任务；相同 key 但请求内容不同时返回冲突。
+- `DeliveryAttempt` 历史：记录每次投递的尝试序号、状态、HTTP 状态码、错误原因、开始/结束时间和下次重试时间。
+- HTTP envelope 安全边界：限制 method、请求大小、Header 白名单，投递前拦截私网/metadata IP，并禁止自动跟随 redirect。
 
 ## 运行方式
 
@@ -37,11 +41,19 @@ go test ./...
 go run ./cmd/server
 ```
 
-默认监听 `:8080`。也可以指定地址和存储文件：
+默认监听 `:8080`，SQLite 数据库文件为 `data/notifications.db`。也可以指定地址和数据库文件：
 
 ```bash
-go run ./cmd/server -addr :8081 -data /tmp/notifications.json
+go run ./cmd/server -addr :8081 -db /tmp/notifications.db
 ```
+
+可以用 `-allowed-hosts` 配置供应商域名白名单：
+
+```bash
+go run ./cmd/server -allowed-hosts api.vendor.example,crm.vendor.example
+```
+
+如果不配置 host allowlist，系统仍会拦截私网、loopback、link-local、metadata IP 和危险 Header，但不会限制公网域名集合。
 
 ## 示例
 
@@ -65,6 +77,18 @@ curl -X POST http://localhost:8080/notifications \
 curl http://localhost:8080/notifications/{notification_id}
 ```
 
+查询投递历史：
+
+```bash
+curl http://localhost:8080/notifications/{notification_id}/attempts
+```
+
+查看失败任务：
+
+```bash
+curl 'http://localhost:8080/notifications?status=FAILED'
+```
+
 手动重试失败任务：
 
 ```bash
@@ -77,28 +101,31 @@ curl -X POST http://localhost:8080/notifications/{notification_id}/retry
 
 1. 接收业务系统提交的外部 HTTP(S) 通知任务。
 2. 在投递前持久化任务，避免进程退出导致任务直接丢失。
-3. 异步调用外部供应商 API，避免业务系统被供应商延迟拖慢。
-4. 对网络错误、超时、5xx、429 等临时失败做有限重试。
-5. 记录任务状态、重试次数、下次重试时间和最后错误。
-6. 提供状态查询和失败后的手动重试入口。
+3. 用 SQLite 任务表表达队列语义，并通过事务领取待投递任务。
+4. 异步调用外部供应商 API，避免业务系统被供应商延迟拖慢。
+5. 对网络错误、超时、5xx、429 等临时失败做有限重试。
+6. 记录任务状态、重试次数、下次重试时间和最后错误。
+7. 记录每一次投递尝试，便于排查供应商错误、网络超时和重试路径。
+8. 提供状态查询、失败任务列表和失败后的手动重试入口。
 
 本系统第一版明确不解决：
 
 1. 不保证 exactly-once。外部 HTTP 请求成功但本地状态更新前进程崩溃时，恢复后可能再次投递。
-2. 不解析供应商业务响应。第一版只关注 HTTP 投递结果，不理解 CRM、广告、库存等业务语义。
-3. 不做供应商配置后台或模板 DSL。当前由业务系统直接提交 URL、Header、Body，先验证可靠投递链路。
+2. 不解析供应商业务响应。第一版只按 HTTP status 判断是否投递成功；响应 body 属于供应商业务语义，例如 `{ "success": false }`，MVP 不处理。
+3. 不做供应商配置后台或模板 DSL。当前用通用 HTTP envelope 支持不同供应商的 URL、Header、Body，先验证可靠投递链路。
 4. 不替外部系统处理业务幂等。系统会透传 `Idempotency-Key`，但外部系统仍需要能接受重复请求。
-5. 不做多租户、复杂权限、审计和供应商级限流。这些是生产化能力，不是 MVP 的核心。
+5. 不托管供应商认证信息。第一版允许业务系统提交必要 Header；生产版本应将供应商 token 收敛到通知服务配置中，避免密钥散落。
+6. 不做多租户、复杂权限、审计和供应商级限流。这些是生产化能力，不是 MVP 的核心。
 
 ## 可靠性与失败处理
 
 投递语义选择 **at-least-once**。
 
-原因是外部 HTTP API 和本地存储之间没有共同事务。只要存在“外部系统已经处理成功，但本服务还没来得及标记成功就崩溃”的窗口，严格 exactly-once 就无法仅靠本服务实现。第一版选择 at-least-once，并通过 `idempotencyKey` 和 `Idempotency-Key` Header 降低重复投递影响。
+原因是外部 HTTP API 和本地存储之间没有共同事务。只要存在“外部系统已经处理成功，但本服务还没来得及标记成功就崩溃”的窗口，严格 exactly-once 就无法仅靠本服务实现。第一版选择 at-least-once，并通过 `idempotencyKey` 和 `Idempotency-Key` Header 降低重复投递影响。`idempotencyKey` 表示业务事件唯一键，用于避免重复提交并帮助下游幂等；如果相同 key 对应不同请求，系统返回冲突，避免误把两个不同业务事件合并。
 
 失败策略：
 
-- 2xx：标记 `SUCCEEDED`。
+- 2xx：标记 `SUCCEEDED`，不解析响应 body。
 - 网络错误 / 超时：标记 `RETRYING`，按指数退避重试。
 - 5xx：认为供应商临时不可用，重试。
 - 408 / 409 / 429：按临时失败处理；如果供应商返回 `Retry-After` 且晚于本地退避时间，则采用更晚的时间。
@@ -106,6 +133,8 @@ curl -X POST http://localhost:8080/notifications/{notification_id}/retry
 - 超过最大尝试次数：标记 `FAILED`，等待人工排查或手动补偿。
 
 长期不可用时，本系统不会无限重试。无限重试看似更可靠，但会让故障供应商持续消耗资源，并可能造成队列积压。第一版用有限重试和失败状态把问题显性化。
+
+第一版不引入外部 MQ。系统使用 SQLite 持久化任务表表达队列语义，超过最大重试次数后进入 `FAILED` 状态，作为 MVP 阶段的逻辑 DLQ。这样可以保留失败任务、错误原因和投递历史，支持人工排查与手动重试。未来当吞吐、隔离和横向扩展需求增长时，再演进为 MQ + DLQ，例如 Kafka、RabbitMQ 或 SQS，由主队列承接正常投递，死信队列承接长期失败任务。
 
 ## 关键工程决策
 
@@ -115,14 +144,22 @@ curl -X POST http://localhost:8080/notifications/{notification_id}/retry
 2. **至少一次，而不是 exactly-once**  
    exactly-once 在外部 HTTP 场景下成本过高，并且需要供应商幂等或事务配合。at-least-once 更现实。
 
-3. **第一版使用文件仓储表达队列语义**  
-   作业环境下不引入数据库驱动或消息队列，仓库可以零依赖运行。生产版本会把 `Store` 接口替换成 PostgreSQL/MySQL 或 MQ-backed 实现。
+3. **第一版使用 SQLite 表达队列语义**  
+   SQLite 是本地嵌入式数据库，不需要额外部署外部中间件；相比 JSON 文件，它能用唯一索引、普通索引和事务更自然地表达任务表、投递历史和任务领取语义。
 
 4. **有限重试**  
    供应商长期不可用时进入 `FAILED`，避免无限重试造成资源耗尽。
 
-5. **用状态机而不是内存 channel 保存任务**  
-   状态和时间字段能表达可恢复的任务生命周期，也便于后续迁移到 SQL 表。
+5. **用状态机和数据库事务，而不是内存 channel 保存任务**  
+   状态和时间字段能表达可恢复的任务生命周期；Worker 通过 `ClaimDue` 在事务中领取任务，减少重复领取同一任务的风险。
+
+6. **保留投递尝试历史**  
+   `Notification` 记录当前状态，`DeliveryAttempt` 记录每次尝试的历史事实。这样排查时不只依赖最后一次错误，也能看到多次重试是否都是同类失败。
+
+7. **HTTP envelope 不是任意 HTTP 代理**  
+   第一版采用 HTTP envelope 以降低供应商接入复杂度，但仍保留安全边界：method 限制、请求大小限制、Header 白名单、私网/metadata IP 拦截、redirect 不自动跟随，以及可配置的目标域名白名单。
+   它的优点是简单直接，能快速支持不同供应商的 URL、Header 和 Body；缺点是业务系统仍需了解供应商协议，也会带来 URL/Header 安全风险。
+   当前实现会在投递前解析目标域名并拦截私网地址；生产版本还应配合网络出口策略或自定义 Dialer，进一步收敛 DNS rebinding 等边界风险。
 
 ## 取舍与演进
 
@@ -130,19 +167,35 @@ AI 曾建议过 Kafka、RabbitMQ、Redis Stream、分布式锁、供应商配置
 
 如果未来流量或复杂度增长，可以按下面方向演进：
 
-1. 存储从文件迁移到 PostgreSQL/MySQL，使用行级锁或状态租约支持多 worker。
+1. 存储从 SQLite 迁移到 PostgreSQL/MySQL，使用行级锁或状态租约支持多实例 worker。
 2. 高吞吐场景引入 Kafka/RabbitMQ/Redis Stream，API 服务只负责持久化和入队，worker 横向消费。
 3. 增加供应商维度限流、熔断和隔离，避免单个供应商故障影响全局投递。
 4. 增加死信队列和补偿后台，支持批量查看、重新投递和人工修复。
 5. 增加指标和日志：成功率、失败率、重试次数、供应商延迟、积压量。
 6. 增加供应商配置中心，把认证、URL、Header、Body 模板从业务请求中抽离。
+7. 从 HTTP envelope 演进到 `vendorId + eventType + payload`，由通知服务统一管理供应商配置、认证、模板、限流和响应解析。
+8. 增强供应商安全策略，将目标域名、认证方式、Header 模板和响应解析统一托管。
+
+当前 SQLite 存储使用两张核心表：
+
+```text
+notifications
+  id, target_url, method, headers, body, status,
+  attempt_count, max_attempts, next_retry_at,
+  last_error, idempotency_key, created_at, updated_at
+
+delivery_attempts
+  id, notification_id, attempt_no, status, status_code,
+  retryable, error, next_retry_at, started_at, finished_at
+```
 
 ## 代码结构
 
 ```text
 cmd/server/main.go              # 服务入口，启动 API 和 worker
 internal/notification/model.go  # 通知任务模型和输入校验
-internal/notification/store.go  # 文件持久化 Store
+internal/notification/store.go  # Store 接口与通用校验
+internal/notification/sqlite_store.go
 internal/notification/handler.go
 internal/notification/delivery.go
 internal/notification/worker.go
@@ -158,9 +211,13 @@ go test ./...
 当前测试覆盖：
 
 - 重试退避策略。
-- `idempotencyKey` 重复提交。
+- `idempotencyKey` 重复提交和同 key 不同请求冲突。
 - 创建和查询 API。
+- HTTP envelope 安全校验，包括 host allowlist、Header allowlist、私网/metadata IP 拦截和 redirect 禁止。
+- 失败任务列表和投递历史查询。
 - worker 成功投递。
 - 临时失败进入 `RETRYING`。
 - 永久失败进入 `FAILED`。
 - 超过最大尝试次数后失败。
+- SQLite 持久化投递历史。
+- `ClaimDue` 领取任务时标记 `SENDING` 并递增尝试次数。

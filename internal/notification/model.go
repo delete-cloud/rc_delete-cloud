@@ -22,6 +22,14 @@ const (
 
 const DefaultMaxAttempts = 5
 
+type AttemptStatus string
+
+const (
+	AttemptSucceeded AttemptStatus = "SUCCEEDED"
+	AttemptRetrying  AttemptStatus = "RETRYING"
+	AttemptFailed    AttemptStatus = "FAILED"
+)
+
 type Notification struct {
 	ID             string            `json:"id"`
 	TargetURL      string            `json:"targetUrl"`
@@ -38,6 +46,19 @@ type Notification struct {
 	UpdatedAt      time.Time         `json:"updatedAt"`
 }
 
+type DeliveryAttempt struct {
+	ID             string        `json:"id"`
+	NotificationID string        `json:"notificationId"`
+	AttemptNo      int           `json:"attemptNo"`
+	Status         AttemptStatus `json:"status"`
+	StatusCode     int           `json:"statusCode,omitempty"`
+	Retryable      bool          `json:"retryable"`
+	Error          string        `json:"error,omitempty"`
+	NextRetryAt    *time.Time    `json:"nextRetryAt,omitempty"`
+	StartedAt      time.Time     `json:"startedAt"`
+	FinishedAt     time.Time     `json:"finishedAt"`
+}
+
 type CreateRequest struct {
 	TargetURL      string            `json:"targetUrl"`
 	Method         string            `json:"method"`
@@ -45,6 +66,15 @@ type CreateRequest struct {
 	Body           json.RawMessage   `json:"body"`
 	IdempotencyKey string            `json:"idempotencyKey"`
 	MaxAttempts    int               `json:"maxAttempts"`
+}
+
+func ParseStatus(value string) (Status, error) {
+	switch Status(value) {
+	case StatusPending, StatusSending, StatusRetrying, StatusSucceeded, StatusFailed:
+		return Status(value), nil
+	default:
+		return "", fmt.Errorf("unknown status %q", value)
+	}
 }
 
 func (r CreateRequest) Validate() error {

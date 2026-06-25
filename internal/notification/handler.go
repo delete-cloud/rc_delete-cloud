@@ -9,15 +9,20 @@ import (
 )
 
 type Handler struct {
-	store Store
-	mux   *http.ServeMux
+	store  Store
+	policy SecurityPolicy
+	mux    *http.ServeMux
 }
 
 func NewHandler(store Store) http.Handler {
+	return NewHandlerWithSecurity(store, DefaultSecurityPolicy())
+}
+
+func NewHandlerWithSecurity(store Store, policy SecurityPolicy) http.Handler {
 	if store == nil {
 		panic("store is required")
 	}
-	h := &Handler{store: store, mux: http.NewServeMux()}
+	h := &Handler{store: store, policy: policy, mux: http.NewServeMux()}
 	h.routes()
 	return h
 }
@@ -29,7 +34,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /healthz", h.health)
 	h.mux.HandleFunc("POST /notifications", h.create)
+	h.mux.HandleFunc("GET /notifications", h.list)
 	h.mux.HandleFunc("GET /notifications/{id}", h.get)
+	h.mux.HandleFunc("GET /notifications/{id}/attempts", h.attempts)
 	h.mux.HandleFunc("POST /notifications/{id}/retry", h.retry)
 }
 
@@ -50,7 +57,15 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := h.policy.ValidateEnvelope(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	created, duplicate, err := h.store.Create(NewNotification(req, time.Now()))
+	if errors.Is(err, ErrIdempotencyConflict) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -60,6 +75,25 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	writeJSON(w, status, created)
+}
+
+func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
+	statusValue := strings.TrimSpace(r.URL.Query().Get("status"))
+	if statusValue == "" {
+		writeError(w, http.StatusBadRequest, "status query is required")
+		return
+	}
+	status, err := ParseStatus(statusValue)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	items, err := h.store.ListByStatus(status)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
@@ -74,6 +108,20 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, n)
+}
+
+func (h *Handler) attempts(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	attempts, err := h.store.ListAttempts(id)
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, "notification not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, attempts)
 }
 
 func (h *Handler) retry(w http.ResponseWriter, r *http.Request) {

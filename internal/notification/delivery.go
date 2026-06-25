@@ -13,6 +13,7 @@ import (
 type DeliveryResult struct {
 	Success      bool
 	Retryable    bool
+	StatusCode   int
 	ErrorMessage string
 	RetryAfter   *time.Time
 }
@@ -23,16 +24,29 @@ type Delivery interface {
 
 type HTTPDelivery struct {
 	client *http.Client
+	policy SecurityPolicy
 }
 
 func NewHTTPDelivery(client *http.Client) HTTPDelivery {
+	return NewHTTPDeliveryWithSecurity(client, DefaultSecurityPolicy())
+}
+
+func NewHTTPDeliveryWithSecurity(client *http.Client, policy SecurityPolicy) HTTPDelivery {
 	if client == nil {
 		panic("http client is required")
 	}
-	return HTTPDelivery{client: client}
+	if client.CheckRedirect == nil {
+		client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+	return HTTPDelivery{client: client, policy: policy}
 }
 
 func (d HTTPDelivery) Send(ctx context.Context, n Notification) DeliveryResult {
+	if err := d.policy.ValidateResolvedTarget(ctx, n.TargetURL); err != nil {
+		return DeliveryResult{Retryable: false, ErrorMessage: err.Error()}
+	}
 	req, err := http.NewRequestWithContext(ctx, n.Method, n.TargetURL, bytes.NewReader(n.Body))
 	if err != nil {
 		return DeliveryResult{Retryable: false, ErrorMessage: err.Error()}
@@ -52,18 +66,20 @@ func (d HTTPDelivery) Send(ctx context.Context, n Notification) DeliveryResult {
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return DeliveryResult{Success: true}
+		return DeliveryResult{Success: true, StatusCode: resp.StatusCode}
 	}
 	retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if isRetryableStatus(resp.StatusCode) {
 		return DeliveryResult{
 			Retryable:    true,
+			StatusCode:   resp.StatusCode,
 			ErrorMessage: fmt.Sprintf("vendor returned HTTP %d", resp.StatusCode),
 			RetryAfter:   retryAfter,
 		}
 	}
 	return DeliveryResult{
 		Retryable:    false,
+		StatusCode:   resp.StatusCode,
 		ErrorMessage: fmt.Sprintf("vendor returned HTTP %d", resp.StatusCode),
 	}
 }
