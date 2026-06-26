@@ -2,6 +2,7 @@ package notification
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -84,8 +85,8 @@ func (w Worker) process(ctx context.Context, n Notification) {
 
 	if result.Success {
 		w.recordAttempt(n, AttemptSucceeded, result, nil, startedAt, now)
-		if err := w.store.MarkSuccess(n.ID, now); err != nil {
-			log.Printf("mark notification success: %v", err)
+		if err := w.store.MarkSuccess(n.ID, n.AttemptCount, now); err != nil {
+			w.logCompletionError(n, err)
 		}
 		return
 	}
@@ -96,8 +97,8 @@ func (w Worker) process(ctx context.Context, n Notification) {
 	}
 	if !result.Retryable || n.AttemptCount >= n.MaxAttempts {
 		w.recordAttempt(n, AttemptFailed, result, nil, startedAt, now)
-		if err := w.store.MarkFailed(n.ID, message, now); err != nil {
-			log.Printf("mark notification failed: %v", err)
+		if err := w.store.MarkFailed(n.ID, message, n.AttemptCount, now); err != nil {
+			w.logCompletionError(n, err)
 		}
 		return
 	}
@@ -107,9 +108,17 @@ func (w Worker) process(ctx context.Context, n Notification) {
 		nextRetryAt = *result.RetryAfter
 	}
 	w.recordAttempt(n, AttemptRetrying, result, &nextRetryAt, startedAt, now)
-	if err := w.store.MarkRetry(n.ID, message, nextRetryAt, now); err != nil {
-		log.Printf("mark notification retrying: %v", err)
+	if err := w.store.MarkRetry(n.ID, message, nextRetryAt, n.AttemptCount, now); err != nil {
+		w.logCompletionError(n, err)
 	}
+}
+
+func (w Worker) logCompletionError(n Notification, err error) {
+	if errors.Is(err, ErrStaleCompletion) {
+		log.Printf("ignore stale completion for notification %s attempt %d", n.ID, n.AttemptCount)
+		return
+	}
+	log.Printf("complete notification %s attempt %d: %v", n.ID, n.AttemptCount, err)
 }
 
 func (w Worker) recordAttempt(n Notification, status AttemptStatus, result DeliveryResult, nextRetryAt *time.Time, startedAt time.Time, finishedAt time.Time) {

@@ -12,18 +12,45 @@ import (
 
 var ErrNotFound = errors.New("notification not found")
 var ErrIdempotencyConflict = errors.New("idempotency key conflicts with an existing notification")
+var ErrStaleCompletion = errors.New("notification completion is stale")
+
+const (
+	DefaultListLimit = 100
+	MaxListLimit     = 500
+)
+
+type ListOptions struct {
+	Limit          int
+	AfterCreatedAt *time.Time
+	AfterID        string
+}
+
+type ListResult struct {
+	Items   []Notification
+	HasMore bool
+}
 
 type Store interface {
 	Create(n Notification) (Notification, bool, error)
 	Get(id string) (Notification, error)
-	ListByStatus(status Status) ([]Notification, error)
+	ListByStatus(status Status, options ListOptions) (ListResult, error)
 	ClaimDue(now time.Time, limit int, sendingLease time.Duration) ([]Notification, error)
-	MarkSuccess(id string, now time.Time) error
-	MarkRetry(id string, lastError string, nextRetryAt time.Time, now time.Time) error
-	MarkFailed(id string, lastError string, now time.Time) error
+	MarkSuccess(id string, attemptNo int, now time.Time) error
+	MarkRetry(id string, lastError string, nextRetryAt time.Time, attemptNo int, now time.Time) error
+	MarkFailed(id string, lastError string, attemptNo int, now time.Time) error
 	RetryFailed(id string, now time.Time) (Notification, error)
 	RecordAttempt(attempt DeliveryAttempt) error
 	ListAttempts(notificationID string) ([]DeliveryAttempt, error)
+}
+
+func normalizeListLimit(limit int) int {
+	if limit <= 0 {
+		return DefaultListLimit
+	}
+	if limit > MaxListLimit {
+		return MaxListLimit
+	}
+	return limit
 }
 
 func validateAttempt(attempt DeliveryAttempt) error {

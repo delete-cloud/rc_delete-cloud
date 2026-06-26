@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -97,7 +98,14 @@ func TestSQLiteStorePersistsAttemptsAndListsByStatus(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record attempt: %v", err)
 	}
-	if err := store.MarkFailed(created.ID, "vendor returned HTTP 503", time.Now()); err != nil {
+	claimed, err := store.ClaimDue(time.Now(), 10, time.Minute)
+	if err != nil {
+		t.Fatalf("claim notification: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed count = %d, want 1", len(claimed))
+	}
+	if err := store.MarkFailed(created.ID, "vendor returned HTTP 503", claimed[0].AttemptCount, time.Now()); err != nil {
 		t.Fatalf("mark failed: %v", err)
 	}
 
@@ -124,15 +132,15 @@ func TestSQLiteStorePersistsAttemptsAndListsByStatus(t *testing.T) {
 		t.Fatalf("attempt status = %s, want %s", attempts[0].Status, AttemptFailed)
 	}
 
-	failed, err := reopened.ListByStatus(StatusFailed)
+	failed, err := reopened.ListByStatus(StatusFailed, ListOptions{})
 	if err != nil {
 		t.Fatalf("list failed notifications: %v", err)
 	}
-	if len(failed) != 1 {
-		t.Fatalf("failed notification count = %d, want 1", len(failed))
+	if len(failed.Items) != 1 {
+		t.Fatalf("failed notification count = %d, want 1", len(failed.Items))
 	}
-	if failed[0].ID != created.ID {
-		t.Fatalf("failed notification id = %s, want %s", failed[0].ID, created.ID)
+	if failed.Items[0].ID != created.ID {
+		t.Fatalf("failed notification id = %s, want %s", failed.Items[0].ID, created.ID)
 	}
 }
 
@@ -185,6 +193,83 @@ func TestSQLiteStoreClaimDueMarksSendingAndIncrementsAttemptCount(t *testing.T) 
 	}
 }
 
+func TestSQLiteStoreRejectsStaleAttemptCompletion(t *testing.T) {
+	store := newTestStore(t)
+	created := createTestNotification(t, store, DefaultMaxAttempts)
+	started := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+
+	firstClaim, err := store.ClaimDue(started, 10, time.Minute)
+	if err != nil {
+		t.Fatalf("claim first attempt: %v", err)
+	}
+	if len(firstClaim) != 1 {
+		t.Fatalf("first claim count = %d, want 1", len(firstClaim))
+	}
+	secondClaim, err := store.ClaimDue(started.Add(2*time.Minute), 10, time.Minute)
+	if err != nil {
+		t.Fatalf("claim expired attempt: %v", err)
+	}
+	if len(secondClaim) != 1 {
+		t.Fatalf("second claim count = %d, want 1", len(secondClaim))
+	}
+	if err := store.MarkSuccess(created.ID, secondClaim[0].AttemptCount, started.Add(2*time.Minute+time.Second)); err != nil {
+		t.Fatalf("mark second attempt success: %v", err)
+	}
+
+	err = store.MarkRetry(created.ID, "late timeout", started.Add(3*time.Minute), firstClaim[0].AttemptCount, started.Add(2*time.Minute+2*time.Second))
+	if !errors.Is(err, ErrStaleCompletion) {
+		t.Fatalf("stale mark retry error = %v, want %v", err, ErrStaleCompletion)
+	}
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("get notification: %v", err)
+	}
+	if got.Status != StatusSucceeded {
+		t.Fatalf("status after stale completion = %s, want %s", got.Status, StatusSucceeded)
+	}
+	if got.LastError != "" {
+		t.Fatalf("last error after stale completion = %q, want empty", got.LastError)
+	}
+}
+
+func TestSQLiteStoreListByStatusUsesLimitAndCursor(t *testing.T) {
+	store := newTestStore(t)
+	base := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	first := createFailedNotificationAt(t, store, base, "first")
+	second := createFailedNotificationAt(t, store, base.Add(time.Second), "second")
+	third := createFailedNotificationAt(t, store, base.Add(2*time.Second), "third")
+
+	page, err := store.ListByStatus(StatusFailed, ListOptions{Limit: 2})
+	if err != nil {
+		t.Fatalf("list first page: %v", err)
+	}
+	if !page.HasMore {
+		t.Fatalf("first page HasMore = false, want true")
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("first page count = %d, want 2", len(page.Items))
+	}
+	if page.Items[0].ID != first.ID || page.Items[1].ID != second.ID {
+		t.Fatalf("first page ids = [%s %s], want [%s %s]", page.Items[0].ID, page.Items[1].ID, first.ID, second.ID)
+	}
+
+	cursorCreatedAt := page.Items[len(page.Items)-1].CreatedAt
+	cursorID := page.Items[len(page.Items)-1].ID
+	nextPage, err := store.ListByStatus(StatusFailed, ListOptions{Limit: 2, AfterCreatedAt: &cursorCreatedAt, AfterID: cursorID})
+	if err != nil {
+		t.Fatalf("list next page: %v", err)
+	}
+	if nextPage.HasMore {
+		t.Fatalf("next page HasMore = true, want false")
+	}
+	if len(nextPage.Items) != 1 {
+		t.Fatalf("next page count = %d, want 1", len(nextPage.Items))
+	}
+	if nextPage.Items[0].ID != third.ID {
+		t.Fatalf("next page id = %s, want %s", nextPage.Items[0].ID, third.ID)
+	}
+}
+
 func newTestStore(t *testing.T) *SQLiteStore {
 	t.Helper()
 	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "notifications.db"))
@@ -197,4 +282,47 @@ func newTestStore(t *testing.T) *SQLiteStore {
 		}
 	})
 	return store
+}
+
+func createFailedNotificationAt(t *testing.T, store *SQLiteStore, createdAt time.Time, event string) Notification {
+	t.Helper()
+	created, duplicate, err := store.Create(NewNotification(CreateRequest{
+		TargetURL:   "https://vendor.example.test/callback",
+		Method:      "POST",
+		Headers:     map[string]string{"Content-Type": "application/json"},
+		Body:        json.RawMessage(`{"event":"` + event + `"}`),
+		MaxAttempts: 1,
+	}, createdAt))
+	if err != nil {
+		t.Fatalf("create failed notification seed: %v", err)
+	}
+	if duplicate {
+		t.Fatalf("new failed notification seed returned duplicate=true")
+	}
+	claimed, err := store.ClaimDue(createdAt.Add(time.Millisecond), 10, time.Minute)
+	if err != nil {
+		t.Fatalf("claim failed notification seed: %v", err)
+	}
+	var attemptNo int
+	for _, item := range claimed {
+		if item.ID == created.ID {
+			attemptNo = item.AttemptCount
+			break
+		}
+	}
+	if attemptNo == 0 {
+		ids := make([]string, 0, len(claimed))
+		for _, item := range claimed {
+			ids = append(ids, item.ID)
+		}
+		t.Fatalf("created notification %s was not claimed; claimed ids=%s", created.ID, strings.Join(ids, ","))
+	}
+	if err := store.MarkFailed(created.ID, "seed failure", attemptNo, createdAt.Add(2*time.Millisecond)); err != nil {
+		t.Fatalf("mark failed notification seed: %v", err)
+	}
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("get failed notification seed: %v", err)
+	}
+	return got
 }

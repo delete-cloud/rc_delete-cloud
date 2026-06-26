@@ -3,6 +3,8 @@ package notification
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,15 +39,40 @@ func TestSecurityPolicyValidatesAllowedHostsAndHeaders(t *testing.T) {
 }
 
 func TestSecurityPolicyRejectsPrivateAndMetadataTargets(t *testing.T) {
-	policy := NewSecurityPolicy([]string{"127.0.0.1", "169.254.169.254"}, DefaultAllowedHeaders())
+	policy := NewSecurityPolicy([]string{
+		"127.0.0.1",
+		"169.254.169.254",
+		"100.64.0.1",
+		"64:ff9b::a9fe:a9fe",
+		"2002:a9fe:a9fe::1",
+	}, DefaultAllowedHeaders())
 	tests := []string{
 		"http://127.0.0.1/callback",
 		"http://169.254.169.254/latest/meta-data",
+		"http://100.64.0.1/internal",
+		"http://[64:ff9b::a9fe:a9fe]/nat64-metadata",
+		"http://[2002:a9fe:a9fe::1]/six-to-four-metadata",
 	}
 	for _, target := range tests {
 		err := policy.ValidateResolvedTarget(context.Background(), target)
-		if err == nil {
-			t.Fatalf("ValidateResolvedTarget(%q) succeeded, want private target error", target)
+		if !errors.Is(err, ErrBlockedTarget) {
+			t.Fatalf("ValidateResolvedTarget(%q) error = %v, want %v", target, err, ErrBlockedTarget)
+		}
+	}
+}
+
+func TestSecurityPolicyDialContextRejectsBlockedIP(t *testing.T) {
+	policy := NewSecurityPolicy(nil, DefaultAllowedHeaders())
+	for _, address := range []string{
+		"169.254.169.254:80",
+		"100.64.0.1:80",
+		"[64:ff9b::a9fe:a9fe]:80",
+		"[::ffff:169.254.169.254]:80",
+		"[2002:a9fe:a9fe::1]:80",
+	} {
+		_, err := policy.DialContext(context.Background(), "tcp", address)
+		if !errors.Is(err, ErrBlockedTarget) {
+			t.Fatalf("DialContext(%q) error = %v, want %v", address, err, ErrBlockedTarget)
 		}
 	}
 }
@@ -81,5 +108,38 @@ func TestHTTPDeliveryDoesNotFollowRedirects(t *testing.T) {
 	}
 	if targetReached {
 		t.Fatalf("redirect target was reached, want redirects disabled")
+	}
+}
+
+func TestHTTPDeliveryOverridesUnsafeClientHooks(t *testing.T) {
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return nil
+		},
+		Transport: &http.Transport{
+			DialTLS: func(_, _ string) (net.Conn, error) {
+				t.Fatalf("custom DialTLS should be cleared")
+				return nil, nil
+			},
+			DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
+				t.Fatalf("custom DialTLSContext should be cleared")
+				return nil, nil
+			},
+		},
+	}
+	NewHTTPDeliveryWithSecurity(client, DefaultSecurityPolicy())
+
+	if err := client.CheckRedirect(&http.Request{}, nil); err != http.ErrUseLastResponse {
+		t.Fatalf("CheckRedirect error = %v, want %v", err, http.ErrUseLastResponse)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.DialTLS != nil {
+		t.Fatalf("DialTLS was not cleared")
+	}
+	if transport.DialTLSContext != nil {
+		t.Fatalf("DialTLSContext was not cleared")
 	}
 }

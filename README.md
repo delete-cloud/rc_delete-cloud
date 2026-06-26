@@ -21,7 +21,7 @@ Business System
 本仓库用 Go 标准库 + SQLite 实现了一个最小可运行版本：
 
 - `POST /notifications`：创建通知任务，返回 `202 Accepted`。
-- `GET /notifications?status=FAILED`：查看指定状态的任务，可用于 MVP 阶段的逻辑 DLQ 排查。
+- `GET /notifications?status=FAILED&limit=100`：分页查看指定状态的任务，可用于 MVP 阶段的逻辑 DLQ 排查。
 - `GET /notifications/{id}`：查询任务状态。
 - `GET /notifications/{id}/attempts`：查询每一次投递尝试记录。
 - `POST /notifications/{id}/retry`：把 `FAILED` 任务重新放回重试队列。手动 retry 不会重置 `attempt_count`，也不会重新给一轮默认 5 次自动重试机会；它保留 attempt history 的单调性，并触发一次新的人工补偿投递。
@@ -32,7 +32,7 @@ Business System
 - 默认最大尝试次数：5 次。
 - `idempotencyKey`：业务事件唯一键。相同 key 且请求内容一致时返回已有任务；相同 key 但请求内容不同时返回冲突。
 - `DeliveryAttempt` 历史：记录每次投递的尝试序号、状态、HTTP 状态码、错误原因、开始/结束时间和下次重试时间。
-- HTTP envelope 安全边界：限制 method、请求大小、Header 白名单，投递前拦截私网/metadata IP，并禁止自动跟随 redirect。
+- HTTP envelope 安全边界：限制 method、请求大小、Header 白名单，投递前和最终拨号路径都会拦截私网/metadata IP，并禁止自动跟随 redirect。
 
 ## 运行方式
 
@@ -86,8 +86,10 @@ curl http://localhost:8080/notifications/{notification_id}/attempts
 查看失败任务：
 
 ```bash
-curl 'http://localhost:8080/notifications?status=FAILED'
+curl 'http://localhost:8080/notifications?status=FAILED&limit=100'
 ```
+
+列表接口返回 `items` 和可选 `nextCursor`；如果存在 `nextCursor`，下一页请求带上 `cursor` 即可。
 
 手动重试失败任务：
 
@@ -106,7 +108,7 @@ curl -X POST http://localhost:8080/notifications/{notification_id}/retry
 5. 对网络错误、超时、5xx、429 等临时失败做有限重试。
 6. 记录任务状态、重试次数、下次重试时间和最后错误。
 7. 记录每一次投递尝试，便于排查供应商错误、网络超时和重试路径。
-8. 提供状态查询、失败任务列表和失败后的手动重试入口。
+8. 提供状态查询、分页失败任务列表和失败后的手动重试入口。
 
 本系统第一版明确不解决：
 
@@ -159,7 +161,7 @@ curl -X POST http://localhost:8080/notifications/{notification_id}/retry
 7. **HTTP envelope 不是任意 HTTP 代理**  
    第一版采用 HTTP envelope 以降低供应商接入复杂度，但仍保留安全边界：method 限制、请求大小限制、Header 白名单、私网/metadata IP 拦截、redirect 不自动跟随，以及可配置的目标域名白名单。
    它的优点是简单直接，能快速支持不同供应商的 URL、Header 和 Body；缺点是业务系统仍需了解供应商协议，也会带来 URL/Header 安全风险。
-   当前实现会在投递前解析目标域名并拦截私网地址；生产版本还应配合网络出口策略或自定义 Dialer，进一步收敛 DNS rebinding 等边界风险。
+   当前实现会在投递前解析目标域名并拦截私网地址，也会在最终 `DialContext` 拨号路径再次校验目标 IP，减少 DNS TOCTOU 风险；生产版本还应配合网络出口策略进一步收敛 SSRF 风险。
 
 ## 取舍与演进
 
@@ -218,8 +220,9 @@ go test ./...
 - 重试退避策略。
 - `idempotencyKey` 重复提交和同 key 不同请求冲突。
 - 创建和查询 API。
-- HTTP envelope 安全校验，包括 host allowlist、Header allowlist、私网/metadata IP 拦截和 redirect 禁止。
+- HTTP envelope 安全校验，包括 host allowlist、Header allowlist、私网/metadata IP 拦截、拨号路径校验和 redirect 禁止。
 - 失败任务列表和投递历史查询。
+- 失败任务列表分页和 trailing JSON 拒绝。
 - worker 成功投递。
 - 临时失败进入 `RETRYING`。
 - 永久失败进入 `FAILED`。

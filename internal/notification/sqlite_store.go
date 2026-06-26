@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -126,16 +127,39 @@ func (s *SQLiteStore) Get(id string) (Notification, error) {
 	return getNotification(s.db, `WHERE id = ?`, id)
 }
 
-func (s *SQLiteStore) ListByStatus(status Status) ([]Notification, error) {
+func (s *SQLiteStore) ListByStatus(status Status, options ListOptions) (ListResult, error) {
 	if _, err := ParseStatus(string(status)); err != nil {
-		return nil, err
+		return ListResult{}, err
 	}
-	rows, err := s.db.Query(notificationSelectSQL()+` WHERE status = ? ORDER BY created_at, id`, string(status))
+	if options.AfterCreatedAt != nil && strings.TrimSpace(options.AfterID) == "" {
+		return ListResult{}, errors.New("after id is required when cursor created_at is set")
+	}
+	limit := normalizeListLimit(options.Limit)
+	query := notificationSelectSQL() + ` WHERE status = ?`
+	args := []any{string(status)}
+	if options.AfterCreatedAt != nil {
+		after := formatSQLiteTime(*options.AfterCreatedAt)
+		query += ` AND (created_at > ? OR (created_at = ? AND id > ?))`
+		args = append(args, after, after, options.AfterID)
+	}
+	query += ` ORDER BY created_at, id LIMIT ?`
+	args = append(args, limit+1)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		return nil, err
+		return ListResult{}, err
 	}
 	defer rows.Close()
-	return scanNotifications(rows)
+	items, err := scanNotifications(rows)
+	if err != nil {
+		return ListResult{}, err
+	}
+	result := ListResult{Items: items}
+	if len(result.Items) > limit {
+		result.HasMore = true
+		result.Items = result.Items[:limit]
+	}
+	return result, nil
 }
 
 func (s *SQLiteStore) ClaimDue(now time.Time, limit int, sendingLease time.Duration) ([]Notification, error) {
@@ -221,16 +245,16 @@ func (s *SQLiteStore) ClaimDue(now time.Time, limit int, sendingLease time.Durat
 	return claimed, nil
 }
 
-func (s *SQLiteStore) MarkSuccess(id string, now time.Time) error {
-	return updateNotificationStatus(s.db, id, StatusSucceeded, "", nil, now)
+func (s *SQLiteStore) MarkSuccess(id string, attemptNo int, now time.Time) error {
+	return updateNotificationStatus(s.db, id, attemptNo, StatusSucceeded, "", nil, now)
 }
 
-func (s *SQLiteStore) MarkRetry(id string, lastError string, nextRetryAt time.Time, now time.Time) error {
-	return updateNotificationStatus(s.db, id, StatusRetrying, lastError, &nextRetryAt, now)
+func (s *SQLiteStore) MarkRetry(id string, lastError string, nextRetryAt time.Time, attemptNo int, now time.Time) error {
+	return updateNotificationStatus(s.db, id, attemptNo, StatusRetrying, lastError, &nextRetryAt, now)
 }
 
-func (s *SQLiteStore) MarkFailed(id string, lastError string, now time.Time) error {
-	return updateNotificationStatus(s.db, id, StatusFailed, lastError, nil, now)
+func (s *SQLiteStore) MarkFailed(id string, lastError string, attemptNo int, now time.Time) error {
+	return updateNotificationStatus(s.db, id, attemptNo, StatusFailed, lastError, nil, now)
 }
 
 func (s *SQLiteStore) RetryFailed(id string, now time.Time) (Notification, error) {
@@ -348,16 +372,21 @@ func insertNotification(tx *sql.Tx, n Notification) error {
 	return nil
 }
 
-func updateNotificationStatus(db *sql.DB, id string, status Status, lastError string, nextRetryAt *time.Time, now time.Time) error {
+func updateNotificationStatus(db *sql.DB, id string, attemptNo int, status Status, lastError string, nextRetryAt *time.Time, now time.Time) error {
+	if attemptNo <= 0 {
+		return errors.New("attempt number must be positive")
+	}
 	result, err := db.Exec(`
 		UPDATE notifications
 		SET status = ?, next_retry_at = ?, last_error = ?, updated_at = ?
-		WHERE id = ?`,
+		WHERE id = ? AND status = ? AND attempt_count = ?`,
 		string(status),
 		formatNullableSQLiteTime(nextRetryAt),
 		lastError,
 		formatSQLiteTime(now),
 		id,
+		string(StatusSending),
+		attemptNo,
 	)
 	if err != nil {
 		return err
@@ -367,7 +396,13 @@ func updateNotificationStatus(db *sql.DB, id string, status Status, lastError st
 		return err
 	}
 	if affected == 0 {
-		return ErrNotFound
+		if _, err := getNotification(db, `WHERE id = ?`, id); errors.Is(err, ErrNotFound) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		return ErrStaleCompletion
 	}
 	return nil
 }

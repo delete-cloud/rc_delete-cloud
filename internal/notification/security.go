@@ -16,6 +16,38 @@ const (
 	defaultMaxHeaderValueSize = 4096
 )
 
+var ErrBlockedTarget = errors.New("target resolves to blocked IP")
+
+var blockedTargetPrefixes = mustParsePrefixes([]string{
+	"0.0.0.0/8",
+	"10.0.0.0/8",
+	"100.64.0.0/10",
+	"127.0.0.0/8",
+	"169.254.0.0/16",
+	"172.16.0.0/12",
+	"192.0.0.0/24",
+	"192.0.2.0/24",
+	"192.168.0.0/16",
+	"198.18.0.0/15",
+	"198.51.100.0/24",
+	"203.0.113.0/24",
+	"224.0.0.0/4",
+	"240.0.0.0/4",
+	"255.255.255.255/32",
+	"::/128",
+	"::1/128",
+	"::ffff:0:0/96",
+	"64:ff9b::/96",
+	"64:ff9b:1::/48",
+	"100::/64",
+	"2001::/23",
+	"2002::/16",
+	"2001:db8::/32",
+	"fc00::/7",
+	"fe80::/10",
+	"ff00::/8",
+})
+
 type SecurityPolicy struct {
 	AllowedHosts       map[string]struct{}
 	AllowedHeaders     map[string]struct{}
@@ -96,10 +128,52 @@ func (p SecurityPolicy) ValidateResolvedTarget(ctx context.Context, rawURL strin
 	}
 	for _, addr := range addrs {
 		if isBlockedTargetIP(addr) {
-			return fmt.Errorf("target host %s resolves to blocked IP %s", host, addr)
+			return fmt.Errorf("%w: target host %s resolves to blocked IP %s", ErrBlockedTarget, host, addr)
 		}
 	}
 	return nil
+}
+
+func (p SecurityPolicy) DialContext(ctx context.Context, network string, address string) (net.Conn, error) {
+	dialer := &net.Dialer{}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("dial target address is invalid: %w", err)
+	}
+	if err := p.validateHostAllowlist(host); err != nil {
+		return nil, err
+	}
+	if p.AllowPrivateIP {
+		return dialer.DialContext(ctx, network, address)
+	}
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve dial target host %s: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("resolve dial target host %s: no addresses", host)
+	}
+	for _, addr := range addrs {
+		if isBlockedTargetIP(addr) {
+			return nil, fmt.Errorf("%w: dial target host %s resolves to blocked IP %s", ErrBlockedTarget, host, addr)
+		}
+	}
+
+	var lastErr error
+	for _, addr := range addrs {
+		if !networkAllowsAddr(network, addr) {
+			continue
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(addr.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no %s address found for %s", network, host)
 }
 
 func (p SecurityPolicy) validateHostAllowlist(host string) error {
@@ -155,10 +229,23 @@ func isBlockedTargetIP(addr netip.Addr) bool {
 	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsUnspecified() || addr.IsMulticast() {
 		return true
 	}
-	if addr.Is4() && addr == netip.MustParseAddr("169.254.169.254") {
-		return true
+	for _, prefix := range blockedTargetPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
 	}
 	return false
+}
+
+func networkAllowsAddr(network string, addr netip.Addr) bool {
+	switch network {
+	case "tcp4":
+		return addr.Is4()
+	case "tcp6":
+		return addr.Is6()
+	default:
+		return true
+	}
 }
 
 func normalizeSet(values []string) map[string]struct{} {
@@ -187,4 +274,12 @@ func normalizeHeaderSet(values []string) map[string]struct{} {
 
 func normalizeHost(host string) string {
 	return strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
+}
+
+func mustParsePrefixes(values []string) []netip.Prefix {
+	prefixes := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		prefixes = append(prefixes, netip.MustParsePrefix(value))
+	}
+	return prefixes
 }

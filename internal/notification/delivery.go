@@ -3,6 +3,7 @@ package notification
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,12 +36,30 @@ func NewHTTPDeliveryWithSecurity(client *http.Client, policy SecurityPolicy) HTT
 	if client == nil {
 		panic("http client is required")
 	}
-	if client.CheckRedirect == nil {
-		client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
+	client.Transport = secureTransport(client.Transport, policy)
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 	return HTTPDelivery{client: client, policy: policy}
+}
+
+func secureTransport(roundTripper http.RoundTripper, policy SecurityPolicy) http.RoundTripper {
+	if roundTripper == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = nil
+		transport.DialContext = policy.DialContext
+		return transport
+	}
+	transport, ok := roundTripper.(*http.Transport)
+	if !ok {
+		panic("http client transport must be *http.Transport or nil")
+	}
+	clone := transport.Clone()
+	clone.Proxy = nil
+	clone.DialContext = policy.DialContext
+	clone.DialTLS = nil
+	clone.DialTLSContext = nil
+	return clone
 }
 
 func (d HTTPDelivery) Send(ctx context.Context, n Notification) DeliveryResult {
@@ -60,6 +79,9 @@ func (d HTTPDelivery) Send(ctx context.Context, n Notification) DeliveryResult {
 
 	resp, err := d.client.Do(req)
 	if err != nil {
+		if errors.Is(err, ErrBlockedTarget) {
+			return DeliveryResult{Retryable: false, ErrorMessage: err.Error()}
+		}
 		return DeliveryResult{Retryable: true, ErrorMessage: err.Error()}
 	}
 	defer resp.Body.Close()

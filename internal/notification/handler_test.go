@@ -81,6 +81,22 @@ func TestHandlerRejectsConflictingIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsTrailingJSONToken(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewHandlerWithSecurity(store, testSecurityPolicy())
+	body := []byte(`{
+		"targetUrl":"https://vendor.example.test/callback",
+		"method":"POST",
+		"headers":{"Content-Type":"application/json"},
+		"body":{"event":"registered"}
+	}{"targetUrl":"https://vendor.example.test/other"}`)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/notifications", bytes.NewReader(body)))
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("create with trailing JSON status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+}
+
 func TestHandlerListsAttemptsAndFailedNotifications(t *testing.T) {
 	store := newTestStore(t)
 	handler := NewHandlerWithSecurity(store, testSecurityPolicy())
@@ -98,7 +114,14 @@ func TestHandlerListsAttemptsAndFailedNotifications(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record attempt: %v", err)
 	}
-	if err := store.MarkFailed(created.ID, "vendor returned HTTP 500", now); err != nil {
+	claimed, err := store.ClaimDue(now, 10, time.Minute)
+	if err != nil {
+		t.Fatalf("claim notification: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed count = %d, want 1", len(claimed))
+	}
+	if err := store.MarkFailed(created.ID, "vendor returned HTTP 500", claimed[0].AttemptCount, now); err != nil {
 		t.Fatalf("mark failed: %v", err)
 	}
 
@@ -125,15 +148,64 @@ func TestHandlerListsAttemptsAndFailedNotifications(t *testing.T) {
 	if listResp.Code != http.StatusOK {
 		t.Fatalf("list status = %d, want %d; body=%s", listResp.Code, http.StatusOK, listResp.Body.String())
 	}
-	var failed []Notification
+	var failed notificationListResponse
 	if err := json.Unmarshal(listResp.Body.Bytes(), &failed); err != nil {
 		t.Fatalf("decode failed response: %v", err)
 	}
-	if len(failed) != 1 {
-		t.Fatalf("failed notification count = %d, want 1", len(failed))
+	if len(failed.Items) != 1 {
+		t.Fatalf("failed notification count = %d, want 1", len(failed.Items))
 	}
-	if failed[0].ID != created.ID {
-		t.Fatalf("failed notification id = %s, want %s", failed[0].ID, created.ID)
+	if failed.Items[0].ID != created.ID {
+		t.Fatalf("failed notification id = %s, want %s", failed.Items[0].ID, created.ID)
+	}
+}
+
+func TestHandlerListsNotificationsWithLimitAndCursor(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewHandlerWithSecurity(store, testSecurityPolicy())
+	base := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	first := createFailedNotificationAt(t, store, base, "first")
+	second := createFailedNotificationAt(t, store, base.Add(time.Second), "second")
+	third := createFailedNotificationAt(t, store, base.Add(2*time.Second), "third")
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/notifications?status=FAILED&limit=2", nil)
+	firstResp := httptest.NewRecorder()
+	handler.ServeHTTP(firstResp, firstReq)
+	if firstResp.Code != http.StatusOK {
+		t.Fatalf("first list status = %d, want %d; body=%s", firstResp.Code, http.StatusOK, firstResp.Body.String())
+	}
+	var firstPage notificationListResponse
+	if err := json.Unmarshal(firstResp.Body.Bytes(), &firstPage); err != nil {
+		t.Fatalf("decode first list response: %v", err)
+	}
+	if len(firstPage.Items) != 2 {
+		t.Fatalf("first page count = %d, want 2", len(firstPage.Items))
+	}
+	if firstPage.Items[0].ID != first.ID || firstPage.Items[1].ID != second.ID {
+		t.Fatalf("first page ids = [%s %s], want [%s %s]", firstPage.Items[0].ID, firstPage.Items[1].ID, first.ID, second.ID)
+	}
+	if firstPage.NextCursor == "" {
+		t.Fatalf("first page nextCursor is empty, want cursor")
+	}
+
+	nextReq := httptest.NewRequest(http.MethodGet, "/notifications?status=FAILED&limit=2&cursor="+firstPage.NextCursor, nil)
+	nextResp := httptest.NewRecorder()
+	handler.ServeHTTP(nextResp, nextReq)
+	if nextResp.Code != http.StatusOK {
+		t.Fatalf("next list status = %d, want %d; body=%s", nextResp.Code, http.StatusOK, nextResp.Body.String())
+	}
+	var nextPage notificationListResponse
+	if err := json.Unmarshal(nextResp.Body.Bytes(), &nextPage); err != nil {
+		t.Fatalf("decode next list response: %v", err)
+	}
+	if len(nextPage.Items) != 1 {
+		t.Fatalf("next page count = %d, want 1", len(nextPage.Items))
+	}
+	if nextPage.Items[0].ID != third.ID {
+		t.Fatalf("next page id = %s, want %s", nextPage.Items[0].ID, third.ID)
+	}
+	if nextPage.NextCursor != "" {
+		t.Fatalf("next page nextCursor = %q, want empty", nextPage.NextCursor)
 	}
 }
 
