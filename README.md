@@ -24,7 +24,7 @@ Business System
 - `GET /notifications?status=FAILED`：查看指定状态的任务，可用于 MVP 阶段的逻辑 DLQ 排查。
 - `GET /notifications/{id}`：查询任务状态。
 - `GET /notifications/{id}/attempts`：查询每一次投递尝试记录。
-- `POST /notifications/{id}/retry`：把 `FAILED` 任务重新放回重试队列。
+- `POST /notifications/{id}/retry`：把 `FAILED` 任务重新放回重试队列。手动 retry 不会重置 `attempt_count`，也不会重新给一轮默认 5 次自动重试机会；它保留 attempt history 的单调性，并触发一次新的人工补偿投递。
 - SQLite 持久化任务表：默认保存到 `data/notifications.db`。
 - 后台 worker：通过 SQLite 事务领取 `PENDING` / `RETRYING` / 超过租约的 `SENDING` 任务。
 - HTTP 投递：第一版只按 HTTP status 判断投递结果，不解析响应 body。2xx 视为成功；网络错误、超时、5xx、408、409、429 视为可重试；其他 4xx 视为永久失败。
